@@ -84,29 +84,11 @@ Place this file in the same directory:
 shape_predictor_68_face_landmarks.dat
 (Download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2)
 
-Run the app:
-
-bash
-Copy
-Edit
-python Driving_management_system.py.py
-📂 Project Structure
-Copy
-Edit
 📁 DriverMonitoringSystem/
 │
 ├── Driving_management_system.py.py
 ├── shape_predictor_68_face_landmarks.dat
 ├── road_view.jpg
 ├── README.md
-💡 Future Improvements
-Add fatigue alerts via sound or vibration
 
-Integrate a deep learning model to improve accuracy
-
-Deploy to mobile or embedded systems (like Raspberry Pi)
-
-Store driver data and logs to a database
-
-🧑‍💻 Author
 Shashank Varanasi
