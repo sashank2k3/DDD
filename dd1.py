@@ -1,284 +1,302 @@
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
 import cv2
+import dlib
 import numpy as np
-import mediapipe as mp
-from ultralytics import YOLO
+from scipy.spatial import distance as dist
 import threading
-import time
-import csv
-from datetime import datetime
 import pyttsx3
+import speech_recognition as sr
+import webbrowser
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from collections import deque
+import time
 
-# Constants
-EAR_THRESHOLD = 0.25
-MAR_THRESHOLD = 0.75
-CONSECUTIVE_FRAMES_EYE = 20
-CONSECUTIVE_FRAMES_MOUTH = 15
-GRAPH_LENGTH = 75
-
-# Landmark indices
-LEFT_EYE = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE = [33, 160, 158, 133, 153, 144]
-MOUTH = [61, 291, 39, 181, 0, 17, 269, 405]
-
-# GUI Parameters
-WINDOW_WIDTH = 1500
-WINDOW_HEIGHT = 900
-SIDEBAR_WIDTH = 450
-THEME_COLOR = (18, 18, 18)
-ACCENT_COLOR = (0, 255, 255)
-WARNING_COLOR = (0, 76, 153)
-GRAPH_GLOW = (50, 255, 255)
-
-# Initialize models
-face_model = YOLO('yolov8n.pt')
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5
-)
-
-# Initialize TTS
+# ========== INITIAL SETUP ========== #
+# Initialize TTS engine
 engine = pyttsx3.init()
 engine.setProperty('rate', 150)
 
-# State variables
-alarm_active = False
-eye_history = []
-mouth_history = []
-fatigue_score = 0
-log_entries = []
+# Color Scheme
+DARK_BG = "#2E3440"
+MEDIUM_BG = "#3B4252"
+LIGHT_BG = "#434C5E"
+ACCENT = "#81A1C1"
+DANGER = "#BF616A"
+SUCCESS = "#A3BE8C"
+TEXT = "#ECEFF4"
 
-def create_gradient(width, height, color1, color2):
-    """Create vertical gradient background"""
-    gradient = np.zeros((height, width, 3), dtype=np.uint8)
-    for y in range(height):
-        t = y / height
-        gradient[y, :] = (1 - t) * np.array(color1) + t * np.array(color2)
-    return gradient
+# EAR/MAR Configuration
+EAR_THRESHOLD = 0.25
+MAR_THRESHOLD = 0.6
+CONSEC_FRAMES = 20
 
-def eye_aspect_ratio(landmarks, eye_indices):
-    """Calculate Eye Aspect Ratio"""
-    points = [np.array([landmarks[i].x, landmarks[i].y]) for i in eye_indices]
-    return (np.linalg.norm(points[1]-points[5]) + np.linalg.norm(points[2]-points[4])) / (2 * np.linalg.norm(points[0]-points[3]))
+# Global Variables
+COUNTER = 0
+STATUS = "Initializing..."
+ear_history = deque(maxlen=100)
+mar_history = deque(maxlen=100)
+listening = False
 
-def mouth_aspect_ratio(landmarks, mouth_indices):
-    """Calculate Mouth Aspect Ratio"""
-    points = [np.array([landmarks[i].x, landmarks[i].y]) for i in mouth_indices]
-    return (np.linalg.norm(points[1]-points[7]) + np.linalg.norm(points[3]-points[5])) / (2 * np.linalg.norm(points[0]-points[4]))
+# ========== FACE DETECTION SETUP ========== #
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
-def create_sidebar():
-    """Create modern glassmorphic sidebar"""
-    sidebar = create_gradient(SIDEBAR_WIDTH, WINDOW_HEIGHT, (30, 30, 30), (10, 10, 10))
-    sidebar = cv2.GaussianBlur(sidebar, (15, 15), 0)
+def eye_aspect_ratio(eye):
+    A = dist.euclidean(eye[1], eye[5])
+    B = dist.euclidean(eye[2], eye[4])
+    C = dist.euclidean(eye[0], eye[3])
+    return (A + B) / (2.0 * C)
 
-    
-    # Glass effect
-    overlay = sidebar.copy()
-    cv2.rectangle(overlay, (0, 0), (SIDEBAR_WIDTH, WINDOW_HEIGHT), (255, 255, 255), -1)
-    sidebar = cv2.addWeighted(overlay, 0.1, sidebar, 0.9, 0)
-    
-    # Title with neon effect
-    cv2.putText(sidebar, "DATA", (40, 80), 
-                cv2.FONT_HERSHEY_COMPLEX, 1.5, (0, 0, 0), 5)
-    cv2.putText(sidebar, "DATA", (40, 80), 
-                cv2.FONT_HERSHEY_COMPLEX, 1.5, ACCENT_COLOR, 2)
-    
-    # Fatigue meter
-    cv2.putText(sidebar, "FATIGUE LEVEL", (40, 150), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.rectangle(sidebar, (40, 160), (400, 170), (50, 50, 50), 1)
-    cv2.rectangle(sidebar, (40, 160), 
-                 (40 + int(360 * (fatigue_score/100)), 170), 
-                 (int(255 * (fatigue_score/100)), 0, 
-                 255 - int(255 * (fatigue_score/100))), -1)
-    
-    return sidebar
+def mouth_aspect_ratio(mouth):
+    A = dist.euclidean(mouth[13], mouth[19])
+    B = dist.euclidean(mouth[14], mouth[18])
+    C = dist.euclidean(mouth[15], mouth[17])
+    D = dist.euclidean(mouth[12], mouth[16])
+    return (A + B + C) / (3.0 * D)
 
-def draw_spectrum_graph(data, width, height, color, threshold):
-    """Create smooth gradient graph with glow effect"""
-    graph = np.zeros((height, width, 3), np.uint8)
-    
-    if len(data) < 2:
-        return graph
-    
-    x = np.linspace(0, width, len(data))
-    y = (np.array(data) * height).clip(0, height)
-    
-    # Create gradient fill
-    for i in range(1, len(data)):
-        alpha = i/len(data)
-        shade = tuple(int(c * alpha) for c in color)
-        cv2.line(graph, 
-                (int(x[i-1]), height - int(y[i-1])),
-                (int(x[i]), height - int(y[i])),
-                shade, 3)
-    
-    # Add glow
-    glow = cv2.GaussianBlur(graph, (23, 23), 0)
-    graph = cv2.addWeighted(graph, 0.7, glow, 0.3, 0)
-    
-    # Threshold line
-    cv2.line(graph, (0, height - int(threshold * height)),
-             (width, height - int(threshold * height)),
-             (100, 100, 255), 2)
-    
-    return graph
+def shape_to_np(shape, dtype="int"):
+    return np.array([[shape.part(i).x, shape.part(i).y] for i in range(68)], dtype=dtype)
 
-def create_radial_gauge(value, max_value, size, color):
-    """Create modern radial gauge with 3D effect"""
-    gauge = np.zeros((size, size, 3), np.uint8)
-    
-    # Base circle
-    cv2.ellipse(gauge, (size//2, size//2),
-               (size//2-10, size//2-10), 0, 0, 360,
-               (50, 50, 50), -1)
-    
-    # Value arc
-    angle = 180 * (value / max_value)
-    cv2.ellipse(gauge, (size//2, size//2),
-               (size//2-10, size//2-10), 0, 0, angle,
-               color, -1)
-    
-    # Glass effect
-    overlay = gauge.copy()
-    cv2.ellipse(overlay, (size//2, size//2),
-               (size//2-5, size//2-5), 0, 0, 360,
-               (255, 255, 255), -1)
-    gauge = cv2.addWeighted(overlay, 0.2, gauge, 0.8, 0)
-    
-    # Center dot
-    cv2.circle(gauge, (size//2, size//2), 5, color, -1)
-    
-    return gauge
+# ========== AI ASSISTANT FUNCTIONS ========== #
+def start_assistant():
+    global listening
+    listening = True
+    threading.Thread(target=listen_for_commands, daemon=True).start()
+    respond("AI Assistant activated! How can I help you?")
 
-def voice_alert(message):
-    """Generate voice alert with queuing"""
-    engine.say(message)
+def stop_assistant():
+    global listening
+    listening = False
+    respond("AI Assistant deactivated")
+
+def listen_for_commands():
+    r = sr.Recognizer()
+    while listening:
+        try:
+            with sr.Microphone() as source:
+                audio = r.listen(source, timeout=3)
+                try:
+                    command = r.recognize_google(audio).lower()
+                    chat_text.config(state="normal")
+                    chat_text.insert('end', f"\nYou: {command}\n", 'user')
+                    chat_text.config(state="disabled")
+                    process_command(command)
+                except sr.UnknownValueError:
+                    pass
+        except Exception as e:
+            print(f"Microphone error: {e}")
+
+def process_command(command):
+    if 'hello' in command:
+        respond("Hello! How can I assist you today?")
+    elif 'navigation' in command:
+        respond("Opening navigation system")
+        webbrowser.open("https://maps.google.com")
+    elif 'emergency' in command:
+        respond("Activating emergency protocols")
+    elif 'stop' in command:
+        stop_assistant()
+    else:
+        respond("Command not recognized")
+
+def respond(text):
+    chat_text.config(state="normal")
+    chat_text.insert('end', f"Assistant: {text}\n", 'assistant')
+    chat_text.config(state="disabled")
+    chat_text.see('end')
+    engine.say(text)
     engine.runAndWait()
 
-# Main processing loop
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, WINDOW_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WINDOW_HEIGHT)
+# ========== MAIN UI SETUP ========== #
+root = tk.Tk()
+root.title("Next-Gen Driver Assist")
+root.attributes('-fullscreen', True)
 
-frame_counter_eye = 0
-frame_counter_mouth = 0
-last_alert_time = 0
+# Configure grid layout
+for i in range(3):
+    root.grid_rowconfigure(i, weight=1, uniform="row")
+    root.grid_columnconfigure(i, weight=1, uniform="col")
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+# Create main frames
+frames = {}
+positions = [(0,0), (0,1), (0,2), (1,0), (1,1), (1,2), (2,0), (2,1), (2,2)]
+for pos in positions:
+    frame = tk.Frame(root, bg=DARK_BG, bd=2, relief="ridge")
+    frame.grid(row=pos[0], column=pos[1], sticky="nsew", padx=5, pady=5)
+    frames[pos] = frame
 
-    # Create main interface
-    final_frame = create_gradient(WINDOW_WIDTH, WINDOW_HEIGHT,
-                                (10, 10, 20), (5, 5, 10))
-    sidebar = create_sidebar()
-    frame = cv2.flip(frame, 1)
+# ========== CAMERA FEEDS ========== #
+# Driver Camera
+cam_label = tk.Label(frames[(0,0)], bg=DARK_BG)
+cam_label.pack(fill="both", expand=True)
+
+# Road View
+road_image = ImageTk.PhotoImage(Image.open("road_view.jpg").resize((640, 480)))
+road_label = tk.Label(frames[(0,1)], image=road_image, bg=DARK_BG)
+road_label.pack(fill="both", expand=True)
+
+# ========== STATUS DISPLAY ========== #
+status_canvas = tk.Canvas(frames[(0,2)], bg=DARK_BG, highlightthickness=0)
+status_canvas.pack(fill="both", expand=True)
+status_indicator = status_canvas.create_oval(50, 50, 150, 150, fill="gray", outline="")
+status_text = status_canvas.create_text(100, 180, text="INITIALIZING", 
+                                      fill=TEXT, font=("Arial", 14, "bold"))
+
+# ========== VEHICLE INFO ========== #
+vehicle_frame = tk.Frame(frames[(1,2)], bg=MEDIUM_BG)
+vehicle_stats = [
+    ("🚗 Distance", "120 km", "#8FBCBB"),
+    ("⛽ Fuel", "50%", DANGER),
+    ("🔋 Battery", "80%", SUCCESS)
+]
+for i, (label, value, color) in enumerate(vehicle_stats):
+    tk.Label(vehicle_frame, text=label, bg=MEDIUM_BG, fg=TEXT, 
+            font=("Arial", 12)).grid(row=i, column=0, sticky="w", padx=10)
+    tk.Label(vehicle_frame, text=value, bg=MEDIUM_BG, fg=color,
+            font=("Arial", 14, "bold")).grid(row=i, column=1, sticky="e", padx=10)
+vehicle_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+# ========== REAL-TIME GRAPHS ========== #
+# EAR Graph
+ear_fig = plt.Figure(figsize=(5,2), dpi=80)
+ear_ax = ear_fig.add_subplot(111)
+ear_line, = ear_ax.plot([], [], color=ACCENT, linewidth=2)
+ear_ax.set_title("Eye Aspect Ratio", color=TEXT, fontsize=10)
+ear_ax.set_facecolor(DARK_BG)
+ear_fig.patch.set_facecolor(DARK_BG)
+ear_ax.tick_params(colors=TEXT)
+ear_canvas = FigureCanvasTkAgg(ear_fig, master=frames[(2,0)])
+ear_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+# MAR Graph
+mar_fig = plt.Figure(figsize=(5,2), dpi=80)
+mar_ax = mar_fig.add_subplot(111)
+mar_line, = mar_ax.plot([], [], color=DANGER, linewidth=2)
+mar_ax.set_title("Mouth Aspect Ratio", color=TEXT, fontsize=10)
+mar_ax.set_facecolor(DARK_BG)
+mar_fig.patch.set_facecolor(DARK_BG)
+mar_ax.tick_params(colors=TEXT)
+mar_canvas = FigureCanvasTkAgg(mar_fig, master=frames[(2,1)])
+mar_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+# ========== CONTROL BUTTONS ========== #
+# AI Controls (1,0)
+ai_control_frame = tk.Frame(frames[(1,0)], bg=DARK_BG)
+btn_start = tk.Button(ai_control_frame, text="🚀 Start AI", command=start_assistant,
+                     bg=SUCCESS, fg=TEXT, font=("Arial", 12, "bold"), padx=20, pady=10)
+btn_stop = tk.Button(ai_control_frame, text="🛑 Stop AI", command=stop_assistant,
+                    bg=DANGER, fg=TEXT, font=("Arial", 12, "bold"), padx=20, pady=10)
+btn_start.pack(fill="x", pady=5)
+btn_stop.pack(fill="x", pady=5)
+ai_control_frame.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.8)
+
+# System Controls (2,2)
+sys_control_frame = tk.Frame(frames[(2,2)], bg=DARK_BG)
+btn_emergency = tk.Button(sys_control_frame, text="⛔ Emergency Exit", command=root.destroy,
+                         bg=DANGER, fg=TEXT, font=("Arial", 12, "bold"), padx=20, pady=10)
+btn_vehicle = tk.Button(sys_control_frame, text="📊 Vehicle Details", 
+                       command=lambda: webbrowser.open('https://example.com'),
+                       bg=ACCENT, fg=TEXT, font=("Arial", 12, "bold"), padx=20, pady=10)
+btn_emergency.pack(fill="x", pady=5)
+btn_vehicle.pack(fill="x", pady=5)
+sys_control_frame.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.8)
+
+# ========== AI CHAT INTERFACE ========== #
+chat_frame = tk.Frame(frames[(1,1)], bg=MEDIUM_BG)
+chat_text = tk.Text(chat_frame, bg=MEDIUM_BG, fg=TEXT, 
+                   font=("Arial", 11), wrap="word", state="disabled")
+scrollbar = ttk.Scrollbar(chat_frame, orient="vertical", command=chat_text.yview)
+chat_text.configure(yscrollcommand=scrollbar.set)
+
+chat_header = tk.Frame(chat_frame, bg=ACCENT)
+tk.Label(chat_header, text="AI Copilot", bg=ACCENT, fg=TEXT,
+        font=("Arial", 12, "bold")).pack(pady=5)
+
+chat_text.tag_configure('user', foreground=TEXT, background=LIGHT_BG)
+chat_text.tag_configure('assistant', foreground=TEXT, background=ACCENT)
+
+chat_header.pack(fill="x")
+chat_text.pack(side="left", fill="both", expand=True)
+scrollbar.pack(side="right", fill="y")
+chat_frame.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.95, relheight=0.9)
+
+# ========== DRIVER MONITORING ========== #
+def update_status():
+    colors = {"Alert": SUCCESS, "Drowsy": DANGER, "Fatigued": "#FFA500"}
+    status_canvas.itemconfig(status_indicator, fill=colors.get(STATUS, "gray"))
+    status_canvas.itemconfig(status_text, text=STATUS.upper())
+    root.after(1000, update_status)
+
+def update_graphs():
+    ear_line.set_data(range(len(ear_history)), list(ear_history))
+    ear_ax.relim()
+    ear_ax.autoscale_view()
+    ear_canvas.draw()
     
-    # Default values
-    avg_ear = EAR_THRESHOLD
-    mar = MAR_THRESHOLD
+    mar_line.set_data(range(len(mar_history)), list(mar_history))
+    mar_ax.relim()
+    mar_ax.autoscale_view()
+    mar_canvas.draw()
+    
+    root.after(100, update_graphs)
 
-    # Face detection
-    results = face_model(frame, verbose=False)
-    boxes = results[0].boxes.xyxy.cpu().numpy()
-    classes = results[0].boxes.cls.cpu().numpy()
-
-    for box, cls in zip(boxes, classes):
-        if cls == 0:  # Person class
-            x1, y1, x2, y2 = map(int, box)
-            face_roi = frame[y1:y2, x1:x2]
+def monitor_driver():
+    global COUNTER, STATUS
+    cap = cv2.VideoCapture(0)
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret: continue
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        rects = detector(gray, 0)
+        
+        for rect in rects:
+            shape = predictor(gray, rect)
+            shape_np = shape_to_np(shape)
             
-            # Stylish face bounding box
-            cv2.rectangle(final_frame, (x1+3, y1+3), (x2+3, y2+3),
-                         (0, 0, 0), 2)
-            cv2.rectangle(final_frame, (x1, y1), (x2, y2),
-                         ACCENT_COLOR, 2)
+            left_eye = shape_np[42:48]
+            right_eye = shape_np[36:42]
+            mouth = shape_np[48:68]
             
-            # Process face mesh
-            rgb_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
-            results_face = face_mesh.process(rgb_face)
+            ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2
+            mar = mouth_aspect_ratio(mouth)
+            
+            ear_history.append(ear)
+            mar_history.append(mar)
+            
+            if mar > MAR_THRESHOLD:
+                STATUS = "Fatigued"
+                COUNTER = 0
+            elif ear < EAR_THRESHOLD:
+                COUNTER += 1
+                if COUNTER > CONSEC_FRAMES:
+                    STATUS = "Drowsy"
+            else:
+                COUNTER = max(0, COUNTER-1)
+                STATUS = "Alert" if COUNTER == 0 else STATUS
+            
+            # Update camera feed
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(img)
+            img = img.resize((cam_label.winfo_width(), cam_label.winfo_height()))
+            img_tk = ImageTk.PhotoImage(img)
+            cam_label.config(image=img_tk)
+            cam_label.image = img_tk
+            
+        root.update_idletasks()
 
-            if results_face.multi_face_landmarks:
-                landmarks = results_face.multi_face_landmarks[0].landmark
-                
-                # Calculate metrics
-                left_ear = eye_aspect_ratio(landmarks, LEFT_EYE)
-                right_ear = eye_aspect_ratio(landmarks, RIGHT_EYE)
-                mar = mouth_aspect_ratio(landmarks, MOUTH)
-                avg_ear = (left_ear + right_ear) / 2
-
-                # Update history
-                eye_history.append(avg_ear)
-                mouth_history.append(mar)
-                while len(eye_history) > GRAPH_LENGTH:
-                    eye_history.pop(0)
-                while len(mouth_history) > GRAPH_LENGTH:
-                    mouth_history.pop(0)
-
-                # Drowsiness detection
-                if avg_ear < EAR_THRESHOLD:
-                    frame_counter_eye += 1
-                    fatigue_score = min(fatigue_score + 1, 100)
-                    if frame_counter_eye >= CONSECUTIVE_FRAMES_EYE:
-                        cv2.putText(final_frame, "DROWSINESS ALERT!",
-                                  (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX,
-                                  0.7, WARNING_COLOR, 2)
-                        if time.time() - last_alert_time > 5:
-                            threading.Thread(target=voice_alert,
-                                          args=("Critical alert! Driver fatigue detected!",)).start()
-                            last_alert_time = time.time()
-                else:
-                    frame_counter_eye = max(0, frame_counter_eye - 1)
-                    fatigue_score = max(0, fatigue_score - 0.5)
-
-                # Yawn detection
-                if mar > MAR_THRESHOLD:
-                    frame_counter_mouth += 1
-                    fatigue_score = min(fatigue_score + 0.8, 100)
-                    if frame_counter_mouth >= CONSECUTIVE_FRAMES_MOUTH:
-                        cv2.putText(final_frame, "YAWNING ALERT!",
-                                  (x1, y1-60), cv2.FONT_HERSHEY_SIMPLEX,
-                                  0.7, WARNING_COLOR, 2)
-                else:
-                    frame_counter_mouth = max(0, frame_counter_mouth - 1)
-
-    # Compose interface
-    video_panel = cv2.resize(frame, (WINDOW_WIDTH-SIDEBAR_WIDTH, WINDOW_HEIGHT))
-    video_panel = cv2.GaussianBlur(video_panel, (5, 5), 0)
-    final_frame[0:WINDOW_HEIGHT, 0:WINDOW_WIDTH-SIDEBAR_WIDTH] = video_panel
+# ========== START APPLICATION ========== #
+if __name__ == "__main__":
+    # Start monitoring threads
+    threading.Thread(target=monitor_driver, daemon=True).start()
     
-    # Add visualizations
-    eye_graph = draw_spectrum_graph(eye_history, SIDEBAR_WIDTH-40, 200,
-                                  GRAPH_GLOW, EAR_THRESHOLD)
-    mouth_graph = draw_spectrum_graph(mouth_history, SIDEBAR_WIDTH-40, 200,
-                                     (0, 200, 100), MAR_THRESHOLD)
+    # Start UI updates
+    update_status()
+    update_graphs()
     
-    sidebar[200:400, 20:SIDEBAR_WIDTH-20] = eye_graph
-    sidebar[420:620, 20:SIDEBAR_WIDTH-20] = mouth_graph
-    
-    ear_gauge = create_radial_gauge(avg_ear, EAR_THRESHOLD*2, 200, ACCENT_COLOR)
-    mar_gauge = create_radial_gauge(mar, MAR_THRESHOLD*1.5, 200, (0, 255, 100))
-    
-    sidebar[650:850, 50:250] = ear_gauge
-    sidebar[650:850, 200:400] = mar_gauge
-    
-    final_frame[0:WINDOW_HEIGHT, WINDOW_WIDTH-SIDEBAR_WIDTH:WINDOW_WIDTH] = sidebar
-    
-    cv2.imshow('Advanced Drowsiness Monitor', final_frame)
-    
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# Save logs and cleanup
-with open('incidents.csv', 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(['Timestamp', 'Event Type', 'Duration'])
-    writer.writerows(log_entries)
-    
-
-cap.release()
-cv2.destroyAllWindows()
+    # Start main loop
+    root.mainloop()
